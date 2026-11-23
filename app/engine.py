@@ -88,6 +88,104 @@ class ReviewItem:
     keep_end_ms: int
 
 
+# Verdict kinds stored on a block item.
+CUE = "cue"
+REVIEW = "review"
+
+
+@dataclass(frozen=True)
+class BlockItem:
+    """A source-level verdict for one line intersecting one block.
+
+    The timecodes here live on the *source reel* and therefore stay valid when
+    the same source range is re-cut at a different finished-film position.  A
+    later publish can reuse the verdict and only re-project the output timecode
+    via :func:`project_items`.
+    """
+
+    kind: str  # ``CUE`` (whole line retained) or ``REVIEW`` (partial line)
+    line_number: int
+    text: str
+    source_start_ms: int
+    source_end_ms: int
+
+
+def items_for_block(block: Block, lines: Iterable[Line]) -> list[BlockItem]:
+    """Intersect every subtitle line with one merged source block.
+
+    A line fully covered by the block yields a ``cue`` verdict; any partial
+    intersection yields a ``review`` verdict carrying the retained source
+    range.  Lines that only touch the block at an exclusive boundary are
+    ignored because all intervals are half-open.
+    """
+
+    items: list[BlockItem] = []
+    for line in lines:
+        covered_start = max(line.start_ms, block.source_start_ms)
+        covered_end = min(line.end_ms, block.source_end_ms)
+        if covered_start >= covered_end:
+            continue
+
+        kind = (
+            CUE
+            if covered_start == line.start_ms and covered_end == line.end_ms
+            else REVIEW
+        )
+        items.append(
+            BlockItem(
+                kind=kind,
+                line_number=line.number,
+                text=line.text,
+                source_start_ms=covered_start,
+                source_end_ms=covered_end,
+            )
+        )
+    return items
+
+
+def project_items(
+    block: Block, items: Iterable[BlockItem]
+) -> tuple[list[Cue], list[ReviewItem]]:
+    """Project source-level block verdicts onto finished-film timecode.
+
+    Clips run at 1:1 speed, so every source offset inside the block maps to the
+    same offset inside its finished-film range.
+    """
+
+    cues: list[Cue] = []
+    reviews: list[ReviewItem] = []
+    for item in items:
+        output_start = block.output_start_ms + (
+            item.source_start_ms - block.source_start_ms
+        )
+        output_end = block.output_start_ms + (
+            item.source_end_ms - block.source_start_ms
+        )
+        if item.kind == CUE:
+            cues.append(
+                Cue(
+                    source_reel_id=block.source_reel_id,
+                    line_number=item.line_number,
+                    text=item.text,
+                    start_ms=output_start,
+                    end_ms=output_end,
+                    source_start_ms=item.source_start_ms,
+                    source_end_ms=item.source_end_ms,
+                )
+            )
+        else:
+            reviews.append(
+                ReviewItem(
+                    source_reel_id=block.source_reel_id,
+                    line_number=item.line_number,
+                    text=item.text,
+                    keep_start_ms=output_start,
+                    keep_end_ms=output_end,
+                )
+            )
+    return cues, reviews
+
+
 def normalize_segments(segments: Iterable[Segment]) -> list[Segment]:
     """Sort segments by output timecode and enforce non-overlap.
 
@@ -188,45 +286,12 @@ def compute(
         if not reel_blocks:
             continue
 
-        for line in lines:
-            for block in reel_blocks:
-                covered_start = max(line.start_ms, block.source_start_ms)
-                covered_end = min(line.end_ms, block.source_end_ms)
-                if covered_start >= covered_end:
-                    continue
-
-                output_start = block.output_start_ms + (
-                    covered_start - block.source_start_ms
-                )
-                output_end = block.output_start_ms + (
-                    covered_end - block.source_start_ms
-                )
-
-                if (
-                    covered_start == line.start_ms
-                    and covered_end == line.end_ms
-                ):
-                    cues.append(
-                        Cue(
-                            source_reel_id=reel_id,
-                            line_number=line.number,
-                            text=line.text,
-                            start_ms=output_start,
-                            end_ms=output_end,
-                            source_start_ms=covered_start,
-                            source_end_ms=covered_end,
-                        )
-                    )
-                else:
-                    reviews.append(
-                        ReviewItem(
-                            source_reel_id=reel_id,
-                            line_number=line.number,
-                            text=line.text,
-                            keep_start_ms=output_start,
-                            keep_end_ms=output_end,
-                        )
-                    )
+        for block in reel_blocks:
+            block_cues, block_reviews = project_items(
+                block, items_for_block(block, lines)
+            )
+            cues.extend(block_cues)
+            reviews.extend(block_reviews)
 
     cues.sort(
         key=lambda c: (

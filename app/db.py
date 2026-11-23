@@ -141,6 +141,36 @@ CREATE TABLE IF NOT EXISTS publication_reviews (
     keep_start_ms   INTEGER NOT NULL,
     keep_end_ms     INTEGER NOT NULL
 );
+
+-- 发布时每个合并块的身份与成片位置。块身份 = 原片号 + 锁定台词版号 + 原片时段；
+-- 下次发布身份相同的块可直接沿用判定，只按新的 output_start_ms 重算成片时码。
+CREATE TABLE IF NOT EXISTS publication_blocks (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    publication_id   INTEGER NOT NULL REFERENCES publications(id) ON DELETE CASCADE,
+    ordinal          INTEGER NOT NULL,
+    source_reel_id   INTEGER NOT NULL,
+    subtitle_version INTEGER NOT NULL,
+    source_start_ms  INTEGER NOT NULL,
+    source_end_ms    INTEGER NOT NULL,
+    output_start_ms  INTEGER NOT NULL
+);
+
+-- 块内每条相交台词的源级判定（整句 cue / 截句 review），时段均为原片时码。
+CREATE TABLE IF NOT EXISTS publication_block_items (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    block_id         INTEGER NOT NULL REFERENCES publication_blocks(id) ON DELETE CASCADE,
+    ordinal          INTEGER NOT NULL,
+    kind             TEXT NOT NULL CHECK (kind IN ('cue', 'review')),
+    line_number      INTEGER NOT NULL,
+    text             TEXT NOT NULL,
+    source_start_ms  INTEGER NOT NULL,
+    source_end_ms    INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_publication_blocks_pub
+    ON publication_blocks(publication_id);
+CREATE INDEX IF NOT EXISTS ix_publication_block_items_block
+    ON publication_block_items(block_id);
 """
 
 

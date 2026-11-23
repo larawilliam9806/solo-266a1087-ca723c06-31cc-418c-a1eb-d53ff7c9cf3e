@@ -69,6 +69,35 @@ def _lines_from_rows(rows: Iterable[dict]) -> list[Line]:
     ]
 
 
+def load_subtitle_lines(
+    conn: sqlite3.Connection, reel_id: int, version: int
+) -> list[Line]:
+    """Read one pinned subtitle document's line detail.
+
+    This is the only place a publish touches ``subtitle_lines``; incremental
+    publishes skip it entirely for reels whose every block was reused.
+    """
+
+    document = conn.execute(
+        """
+        SELECT id FROM subtitle_documents
+         WHERE source_reel_id = ? AND version = ?
+        """,
+        (reel_id, version),
+    ).fetchone()
+    if document is None:
+        return []
+    line_rows = _all(
+        conn,
+        """
+        SELECT number, start_ms, end_ms, text FROM subtitle_lines
+         WHERE document_id = ? ORDER BY start_ms, end_ms, number
+        """,
+        (document["id"],),
+    )
+    return _lines_from_rows(line_rows)
+
+
 # ---------------------------------------------------------------------------
 # source reels and subtitles
 # ---------------------------------------------------------------------------
@@ -557,24 +586,7 @@ def _compute(
     for reel_id, version in pins.items():
         if version == 0:
             continue
-        doc = conn.execute(
-            """
-            SELECT id FROM subtitle_documents
-             WHERE source_reel_id = ? AND version = ?
-            """,
-            (reel_id, version),
-        ).fetchone()
-        if doc is None:
-            continue
-        line_rows = _all(
-            conn,
-            """
-            SELECT number, start_ms, end_ms, text FROM subtitle_lines
-             WHERE document_id = ? ORDER BY start_ms, end_ms, number
-            """,
-            (doc["id"],),
-        )
-        subtitles[reel_id] = _lines_from_rows(line_rows)
+        subtitles[reel_id] = load_subtitle_lines(conn, reel_id, version)
 
     cues, reviews = engine.compute(segments, subtitles)
 
@@ -672,6 +684,192 @@ def delivery_preview(conn: sqlite3.Connection, delivery_id: int) -> dict:
     }
 
 
+def _last_block_verdicts(
+    conn: sqlite3.Connection, film_id: int
+) -> dict[tuple[int, int, int, int], list[engine.BlockItem]]:
+    """Load the merged-block verdicts of the film's last successful publish.
+
+    Keyed by block identity ``(reel, pinned subtitle version, source start,
+    source end)``.  Publications written before the incremental upgrade have no
+    block rows, so an empty mapping is returned and the next publish simply
+    re-checks everything from scratch.
+    """
+
+    publication = conn.execute(
+        "SELECT id FROM publications WHERE film_id = ? ORDER BY output_version DESC LIMIT 1",
+        (film_id,),
+    ).fetchone()
+    if publication is None:
+        return {}
+
+    cache: dict[tuple[int, int, int, int], list[engine.BlockItem]] = {}
+    block_rows = _all(
+        conn,
+        """
+        SELECT id, source_reel_id, subtitle_version, source_start_ms, source_end_ms
+          FROM publication_blocks
+         WHERE publication_id = ?
+         ORDER BY ordinal
+        """,
+        (publication["id"],),
+    )
+    for block_row in block_rows:
+        item_rows = _all(
+            conn,
+            """
+            SELECT kind, line_number, text, source_start_ms, source_end_ms
+              FROM publication_block_items
+             WHERE block_id = ?
+             ORDER BY ordinal
+            """,
+            (block_row["id"],),
+        )
+        items = [
+            engine.BlockItem(
+                kind=row["kind"],
+                line_number=row["line_number"],
+                text=row["text"],
+                source_start_ms=row["source_start_ms"],
+                source_end_ms=row["source_end_ms"],
+            )
+            for row in item_rows
+        ]
+        cache[
+            (
+                block_row["source_reel_id"],
+                block_row["subtitle_version"],
+                block_row["source_start_ms"],
+                block_row["source_end_ms"],
+            )
+        ] = items
+    return cache
+
+
+def _incremental_compute(
+    conn: sqlite3.Connection,
+    film_id: int,
+    edit_table_id: int,
+    pins: dict[int, int],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Compute a publish reusing verdicts from the previous successful one.
+
+    Returns ``(cue_payload, review_payload, block_records)`` where every block
+    record carries its source-level items so the result can be frozen again.
+
+    A block is reused when its identity (source reel, the subtitle version
+    pinned by this delivery, source range) appeared in the last publication.
+    Reused blocks keep their whole-line / partial-line verdicts but get fresh
+    finished-film timecodes.  A reel whose blocks are all reused never has its
+    subtitle line detail read; reels with any new block are read once and only
+    the new blocks are re-checked.
+    """
+
+    segment_rows = _all(
+        conn,
+        """
+        SELECT source_reel_id, source_start_ms, source_end_ms, output_start_ms
+          FROM edit_segments WHERE edit_table_id = ? ORDER BY position
+        """,
+        (edit_table_id,),
+    )
+    blocks = engine.build_blocks(_segments_from_rows(segment_rows))
+
+    previous = _last_block_verdicts(conn, film_id)
+
+    # Reels that need a fresh verdict on at least one block are loaded once;
+    # fully reused reels (including reels with no pinned subtitle version) are
+    # never read.
+    fresh_reels = {
+        block.source_reel_id
+        for block in blocks
+        if (
+            block.source_reel_id,
+            pins.get(block.source_reel_id, 0),
+            block.source_start_ms,
+            block.source_end_ms,
+        )
+        not in previous
+        and pins.get(block.source_reel_id, 0) != 0
+    }
+    lines_by_reel = {
+        reel_id: load_subtitle_lines(conn, reel_id, pins[reel_id])
+        for reel_id in sorted(fresh_reels)
+    }
+
+    names = {
+        row["id"]: row["name"]
+        for row in conn.execute("SELECT id, name FROM source_reels").fetchall()
+    }
+
+    cue_payload: list[dict] = []
+    review_payload: list[dict] = []
+    block_records: list[dict] = []
+
+    for block in blocks:
+        reel_id = block.source_reel_id
+        version = pins.get(reel_id, 0)
+        identity = (reel_id, version, block.source_start_ms, block.source_end_ms)
+
+        if identity in previous:
+            items = previous[identity]
+        else:
+            items = engine.items_for_block(block, lines_by_reel.get(reel_id, []))
+
+        block_cues, block_reviews = engine.project_items(block, items)
+        cue_payload.extend(
+            {
+                "source_reel_id": cue.source_reel_id,
+                "source_reel_name": names.get(cue.source_reel_id),
+                "line_number": cue.line_number,
+                "text": cue.text,
+                "start_ms": cue.start_ms,
+                "end_ms": cue.end_ms,
+                "source_start_ms": cue.source_start_ms,
+                "source_end_ms": cue.source_end_ms,
+            }
+            for cue in block_cues
+        )
+        review_payload.extend(
+            {
+                "source_reel_id": review.source_reel_id,
+                "source_reel_name": names.get(review.source_reel_id),
+                "line_number": review.line_number,
+                "text": review.text,
+                "keep_start_ms": review.keep_start_ms,
+                "keep_end_ms": review.keep_end_ms,
+            }
+            for review in block_reviews
+        )
+        block_records.append(
+            {
+                "source_reel_id": reel_id,
+                "subtitle_version": version,
+                "source_start_ms": block.source_start_ms,
+                "source_end_ms": block.source_end_ms,
+                "output_start_ms": block.output_start_ms,
+                "items": items,
+            }
+        )
+
+    cue_payload.sort(
+        key=lambda c: (
+            c["start_ms"],
+            c["end_ms"],
+            c["source_reel_id"],
+            c["line_number"],
+        )
+    )
+    review_payload.sort(
+        key=lambda r: (
+            r["keep_start_ms"],
+            r["keep_end_ms"],
+            r["source_reel_id"],
+            r["line_number"],
+        )
+    )
+    return cue_payload, review_payload, block_records
+
+
 def publish_delivery(conn: sqlite3.Connection, delivery_id: int) -> tuple[bool, dict]:
     """Publish or reject.  Returns ``(published, payload)``.
 
@@ -703,7 +901,9 @@ def publish_delivery(conn: sqlite3.Connection, delivery_id: int) -> tuple[bool, 
         )
         return False, rejection
 
-    cues, reviews = _compute(conn, row["edit_table_id"], pins)
+    cues, reviews, block_records = _incremental_compute(
+        conn, row["film_id"], row["edit_table_id"], pins
+    )
 
     next_output = conn.execute(
         "SELECT COALESCE(MAX(output_version), 0) + 1 AS v FROM publications WHERE film_id = ?",
@@ -777,6 +977,49 @@ def publish_delivery(conn: sqlite3.Connection, delivery_id: int) -> tuple[bool, 
             for ordinal, review in enumerate(reviews)
         ],
     )
+
+    # Freeze the source-level verdicts per merged block so the next publish can
+    # reuse them and only re-project finished-film timecodes.
+    for block_ordinal, record in enumerate(block_records):
+        block_cur = conn.execute(
+            """
+            INSERT INTO publication_blocks
+                (publication_id, ordinal, source_reel_id, subtitle_version,
+                 source_start_ms, source_end_ms, output_start_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                publication_id,
+                block_ordinal,
+                record["source_reel_id"],
+                record["subtitle_version"],
+                record["source_start_ms"],
+                record["source_end_ms"],
+                record["output_start_ms"],
+            ),
+        )
+        block_id = int(block_cur.lastrowid)
+        conn.executemany(
+            """
+            INSERT INTO publication_block_items
+                (block_id, ordinal, kind, line_number, text,
+                 source_start_ms, source_end_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    block_id,
+                    item_ordinal,
+                    item.kind,
+                    item.line_number,
+                    item.text,
+                    item.source_start_ms,
+                    item.source_end_ms,
+                )
+                for item_ordinal, item in enumerate(record["items"])
+            ],
+        )
+
     conn.execute(
         """
         UPDATE deliveries
